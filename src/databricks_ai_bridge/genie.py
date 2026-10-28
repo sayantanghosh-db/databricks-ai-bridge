@@ -21,6 +21,11 @@ TERMINAL_STATES = {
     "QUERY_RESULT_EXPIRED",
 }
 
+# Structured error type constants surfaced in GenieResponse.error_type
+GENIE_ERROR_BUDGET_EXCEEDED = "BUDGET_EXCEEDED"
+GENIE_ERROR_PERMISSION_DENIED = "PERMISSION_DENIED"
+GENIE_ERROR_UNKNOWN = "UNKNOWN"
+
 
 # Define a function to count tokens
 def _count_tokens(text):
@@ -38,6 +43,7 @@ class GenieResponse:
     conversation_id: Optional[str] = None
     suggested_questions: Optional[List[str]] = None
     text_attachment_content: Optional[str] = ""
+    error_type: Optional[str] = None
 
 
 @mlflow_trace(span_type="PARSER")
@@ -256,6 +262,39 @@ def _extract_text_attachment_content_from_attachments(attachments) -> Optional[s
     return "\n\n".join(contents)
 
 
+def _classify_genie_error(error) -> str:
+    """Classify a Genie API error payload into a known error type constant.
+
+    The Genie API may return error as a dict (with ``error_code`` / ``message``)
+    or as a plain string.  We normalise both forms and pattern-match against
+    known categories so callers can branch without parsing free-form text.
+    """
+    if isinstance(error, dict):
+        code = (error.get("error_code") or "").lower()
+        message = (error.get("message") or "").lower()
+    else:
+        code = ""
+        message = str(error).lower() if error else ""
+
+    combined = f"{code} {message}"
+
+    if "budget" in combined and "exceeded" in combined:
+        return GENIE_ERROR_BUDGET_EXCEEDED
+    if any(
+        kw in combined
+        for kw in [
+            "permission_denied",
+            "permission denied",
+            "not authorized",
+            "access denied",
+            "does not have privilege",
+            "forbidden",
+        ]
+    ):
+        return GENIE_ERROR_PERMISSION_DENIED
+    return GENIE_ERROR_UNKNOWN
+
+
 class Genie:
     def __init__(
         self,
@@ -440,8 +479,16 @@ class Genie:
                         return GenieResponse(result=f"Genie query {current_status.lower()}.")
 
                     elif current_status == "FAILED":
+                        error = resp.get("error", "Unknown error")
+                        error_type = _classify_genie_error(error)
+                        error_msg = (
+                            error.get("message", str(error))
+                            if isinstance(error, dict)
+                            else str(error)
+                        )
                         return GenieResponse(
-                            result=f"Genie query failed with error: {resp.get('error', 'Unknown error')}"
+                            result=f"Genie query failed with error: {error_msg}",
+                            error_type=error_type,
                         )
                     # includes EXECUTING_QUERY, Genie can retry after this status
                     else:

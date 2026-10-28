@@ -8,7 +8,11 @@ import pandas as pd
 import pytest
 
 from databricks_ai_bridge.genie import (
+    GENIE_ERROR_BUDGET_EXCEEDED,
+    GENIE_ERROR_PERMISSION_DENIED,
+    GENIE_ERROR_UNKNOWN,
     Genie,
+    _classify_genie_error,
     _count_tokens,
     _extract_suggested_questions_from_attachment,
     _extract_text_attachment_content_from_attachments,
@@ -1101,3 +1105,101 @@ def test_poll_null_attachments(genie, mock_workspace_client):
     result = genie.poll_for_result("conv_123", "msg_456")
     assert result.suggested_questions is None
     assert result.text_attachment_content == ""
+
+
+# ---------------------------------------------------------------------------
+# _classify_genie_error
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "error,expected",
+    [
+        # dict payload — error_code field
+        ({"error_code": "BUDGET_EXCEEDED", "message": "Query budget exceeded."}, GENIE_ERROR_BUDGET_EXCEEDED),
+        # dict payload — message text only
+        ({"message": "The query budget has been exceeded for this service principal."}, GENIE_ERROR_BUDGET_EXCEEDED),
+        # plain string
+        ("budget exceeded for workspace", GENIE_ERROR_BUDGET_EXCEEDED),
+        # permission denied via error_code
+        ({"error_code": "PERMISSION_DENIED", "message": "User lacks access."}, GENIE_ERROR_PERMISSION_DENIED),
+        # permission denied via message text
+        ({"message": "User does not have privilege to query table."}, GENIE_ERROR_PERMISSION_DENIED),
+        # access denied string
+        ("access denied: table not accessible", GENIE_ERROR_PERMISSION_DENIED),
+        # not authorized string
+        ("not authorized to access this resource", GENIE_ERROR_PERMISSION_DENIED),
+        # unknown error dict
+        ({"error_code": "INTERNAL_ERROR", "message": "Something went wrong."}, GENIE_ERROR_UNKNOWN),
+        # unknown error string
+        ("an unexpected error occurred", GENIE_ERROR_UNKNOWN),
+        # None / missing
+        (None, GENIE_ERROR_UNKNOWN),
+        ("", GENIE_ERROR_UNKNOWN),
+    ],
+)
+def test_classify_genie_error(error, expected):
+    assert _classify_genie_error(error) == expected
+
+
+# ---------------------------------------------------------------------------
+# poll_for_result — FAILED path sets error_type
+# ---------------------------------------------------------------------------
+
+
+def test_poll_for_result_failed_budget_exceeded(genie, mock_workspace_client):
+    mock_workspace_client.genie._api.do.side_effect = [
+        {
+            "status": "FAILED",
+            "error": {"error_code": "BUDGET_EXCEEDED", "message": "Query budget exceeded."},
+        }
+    ]
+    result = genie.poll_for_result("123", "456")
+
+    assert result.error_type == GENIE_ERROR_BUDGET_EXCEEDED
+    assert "budget exceeded" in result.result.lower()
+
+
+def test_poll_for_result_failed_permission_denied(genie, mock_workspace_client):
+    mock_workspace_client.genie._api.do.side_effect = [
+        {
+            "status": "FAILED",
+            "error": {
+                "error_code": "PERMISSION_DENIED",
+                "message": "User does not have privilege to query table.",
+            },
+        }
+    ]
+    result = genie.poll_for_result("123", "456")
+
+    assert result.error_type == GENIE_ERROR_PERMISSION_DENIED
+    assert "privilege" in result.result.lower()
+
+
+def test_poll_for_result_failed_unknown_error(genie, mock_workspace_client):
+    mock_workspace_client.genie._api.do.side_effect = [
+        {"status": "FAILED", "error": "An unexpected internal error occurred."}
+    ]
+    result = genie.poll_for_result("123", "456")
+
+    assert result.error_type == GENIE_ERROR_UNKNOWN
+    assert "unexpected" in result.result.lower()
+
+
+def test_poll_for_result_failed_missing_error_field(genie, mock_workspace_client):
+    """error key absent in response — should not raise and should fall back gracefully."""
+    mock_workspace_client.genie._api.do.side_effect = [{"status": "FAILED"}]
+    result = genie.poll_for_result("123", "456")
+
+    assert result.error_type == GENIE_ERROR_UNKNOWN
+    assert "unknown error" in result.result.lower()
+
+
+def test_poll_for_result_success_has_no_error_type(genie, mock_workspace_client):
+    """Successful responses must not populate error_type."""
+    mock_workspace_client.genie._api.do.side_effect = [
+        {"status": "COMPLETED", "attachments": [{"text": {"content": "All good."}}]}
+    ]
+    result = genie.poll_for_result("123", "456")
+
+    assert result.error_type is None
