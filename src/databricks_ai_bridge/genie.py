@@ -262,33 +262,32 @@ def _extract_text_attachment_content_from_attachments(attachments) -> Optional[s
     return "\n\n".join(contents)
 
 
-def _classify_genie_error(error) -> str:
+def _classify_genie_error(error: Optional[Union[Dict[str, Any], str]]) -> str:
     """Classify a Genie API error payload into a known error type constant.
 
     The Genie API may return error as a dict (with ``error_code`` / ``message``)
-    or as a plain string.  We normalise both forms and pattern-match against
-    known categories so callers can branch without parsing free-form text.
+    or as a plain string.  An exact ``error_code`` match is preferred; message
+    text is used as a fallback when the code is absent or unrecognised.
     """
     if isinstance(error, dict):
         code = (error.get("error_code") or "").lower()
+        if code == "budget_exceeded":
+            return GENIE_ERROR_BUDGET_EXCEEDED
+        if code == "permission_denied":
+            return GENIE_ERROR_PERMISSION_DENIED
         message = (error.get("message") or "").lower()
     else:
-        code = ""
         message = str(error).lower() if error else ""
 
-    combined = f"{code} {message}"
-
-    if "budget" in combined and "exceeded" in combined:
+    if "budget" in message and "exceeded" in message:
         return GENIE_ERROR_BUDGET_EXCEEDED
     if any(
-        kw in combined
+        kw in message
         for kw in [
-            "permission_denied",
             "permission denied",
             "not authorized",
             "access denied",
             "does not have privilege",
-            "forbidden",
         ]
     ):
         return GENIE_ERROR_PERMISSION_DENIED
